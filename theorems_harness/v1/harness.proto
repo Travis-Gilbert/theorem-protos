@@ -1,0 +1,278 @@
+// Copyright 2026 Travis Gilbert. MIT licensed.
+//
+// theorems-harness gRPC contract.
+//
+// The harness is Theseus's mechanism for giving any agent — Claude Code,
+// Codex, or future integrations — persistent identity, cross-agent
+// coordination, and access to Theseus's search abilities. The
+// implementation is RustyRedCore-THG (the Theseus-customized fork of
+// RustyRed Core with THG protocol native support), but the contract
+// stands alone as a product surface.
+//
+// This proto covers the harness-specific operations: sessions, mention-
+// based cross-agent coordination, presence, and per-agent memory.
+//
+// Database operations (graph/vector/fulltext/spatial) that the harness
+// also exposes have an IDENTICAL surface to rustyred.v1.GraphDatabase —
+// in this proto they are NOT re-declared. A theorems-harness server
+// implementation MOUNTS BOTH services on its gRPC endpoint:
+// theorems_harness.v1.HarnessService for coordination + memory, and
+// rustyred.v1.GraphDatabase for storage. Consumers depending only on
+// the database surface can consume rustyred.v1 alone; consumers using
+// the coordination surface depend on both.
+//
+// Spec reference: the original feature spec for cross-agent coordination,
+// persistent agent identity, and the gRPC harness API lives at
+// https://github.com/Travis-Gilbert/Theseus/blob/main/Theseus/Feature%20Spec%20Cross-Agent%20Coordination%2C%20Persistent%20Agent%20Identity%2C%20and%20gRPC%20Harness%20API.md
+//
+// Versioning: theorems_harness.v1 is the first stable contract. v1.0
+// ships Sessions + Presence + AgentMemory + Coordinate; the Subscribe
+// stream and the full CheckMentions API land in v1.1 per the spec's
+// staged rollout. Method signatures defined here are forward-compatible.
+
+syntax = "proto3";
+
+package theorems_harness.v1;
+
+
+// ============================================================================
+// Service: HarnessService
+// ============================================================================
+//
+// The harness contract. Database operations live in rustyred.v1; this
+// service covers session lifecycle, mention-based coordination, presence,
+// and per-agent memory.
+
+service HarnessService {
+  // ---- Sessions ------------------------------------------------------------
+  rpc StartSession(StartSessionRequest) returns (SessionContext);
+  rpc EndSession(EndSessionRequest) returns (SessionSummary);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatAck);
+
+  // ---- Cross-agent coordination -------------------------------------------
+  // Coordinate writes a section to an orchestrate document and fires
+  // @mention events to the named target actors. Returns immediately with
+  // an acknowledgement; events are delivered via Subscribe.
+  rpc Coordinate(CoordinateRequest) returns (CoordinateAck);
+  // Subscribe is a server-streaming RPC that delivers Event messages
+  // to the caller as they fire. Channel names: `mentions.<actor-id>`,
+  // `presence.<actor-id>`, `commons`.
+  rpc Subscribe(SubscribeRequest) returns (stream Event);
+  // CheckMentions is a pull-based alternative to Subscribe — useful for
+  // lifecycle hooks that fire at discrete moments (SessionStart,
+  // PostToolUse) rather than continuously streaming.
+  rpc CheckMentions(CheckMentionsRequest) returns (MentionsResponse);
+
+  // ---- Presence ------------------------------------------------------------
+  rpc GetPresence(GetPresenceRequest) returns (PresenceResponse);
+
+  // ---- Agent memory --------------------------------------------------------
+  // LoadAgentMemory returns the per-agent scoped subgraph that holds the
+  // calling actor's continuity (observations, priors about other agents,
+  // priors about the user, standing intentions, conventions).
+  rpc LoadAgentMemory(LoadAgentMemoryRequest) returns (AgentMemory);
+  // WriteAgentMemory appends a single observation to the calling actor's
+  // memory layer. Typically called from SessionEnd hooks.
+  rpc WriteAgentMemory(WriteAgentMemoryRequest) returns (WriteAck);
+}
+
+
+// ============================================================================
+// Sessions
+// ============================================================================
+
+message StartSessionRequest {
+  // Actor identifier (e.g., "claude-code", "codex", "human-travis").
+  string actor_id = 1;
+  // User account under which this session runs.
+  string user_id = 2;
+  // Optional task identifier this session is attached to.
+  string task_id = 3;
+  // Free-form initial context the agent wants the harness to be aware of.
+  string initial_brief = 4;
+}
+
+message SessionContext {
+  string session_id = 1;
+  string actor_id = 2;
+  string user_id = 3;
+  // Compiled context artifact body the SessionStart hook should inject
+  // into the agent's prompt. Includes user-graph context, agent-memory,
+  // pending mentions surface.
+  string context_brief = 4;
+  // Pending mentions captured in the brief above, surfaced separately for
+  // structured access.
+  repeated Mention pending_mentions = 5;
+  uint64 brief_token_count = 6;
+}
+
+message EndSessionRequest {
+  string session_id = 1;
+  // Optional summary the agent wants captured to its memory layer.
+  string self_summary = 2;
+  // Optional commons.md note the agent decided to leave.
+  string commons_note = 3;
+}
+
+message SessionSummary {
+  string session_id = 1;
+  uint32 observations_captured = 2;
+  uint32 mentions_drained = 3;
+  uint64 duration_ms = 4;
+}
+
+message HeartbeatRequest {
+  string session_id = 1;
+}
+
+message HeartbeatAck {
+  bool ok = 1;
+  // Renewed TTL in seconds.
+  uint32 presence_ttl_seconds = 2;
+}
+
+
+// ============================================================================
+// Coordination
+// ============================================================================
+
+enum Urgency {
+  URGENCY_UNSPECIFIED = 0;
+  URGENCY_INFO = 1;     // FYI; no response expected. Logged but not surfaced unless asked.
+  URGENCY_ASK = 2;      // Input requested. Surfaces on next prompt. Response expected but not required.
+  URGENCY_BLOCK = 3;    // Cannot proceed without. Strongly surfaces. Escalates to user on timeout.
+}
+
+message CoordinateRequest {
+  string session_id = 1;
+  // Orchestrate document id this section attaches to. The harness creates
+  // the document on first reference per (user_id, task_id).
+  string doc_id = 2;
+  // Section body. Should include `@<actor-id>` mentions inline.
+  string message = 3;
+  // Urgency level applied to all mentions in this section. Default ASK.
+  Urgency urgency = 4;
+}
+
+message CoordinateAck {
+  string section_id = 1;
+  // The actor IDs the harness parsed as mentioned in this section.
+  repeated string mentioned_actors = 2;
+  // Per-mentioned-actor presence at write time, so the caller can decide
+  // whether to wait for a response or proceed.
+  map<string, bool> mentioned_actor_active = 3;
+}
+
+message SubscribeRequest {
+  string session_id = 1;
+  // Channel patterns. Examples: "mentions.<actor-id>", "presence.<actor-id>",
+  // "commons". Empty = subscribe to the caller's own mentions.<actor-id>.
+  repeated string channels = 2;
+}
+
+message Event {
+  string event_id = 1;
+  string channel = 2;
+  // Event type: "mention", "presence_changed", "commons_note".
+  string type = 3;
+  // JSON-encoded payload, type-specific shape. v1.1 may promote to oneof.
+  string payload_json = 4;
+  // Server-side timestamp.
+  int64 timestamp_unix_ms = 5;
+}
+
+message CheckMentionsRequest {
+  string session_id = 1;
+  // Only return mentions since this timestamp (unix ms). 0 = all pending.
+  int64 since_unix_ms = 2;
+  uint32 limit = 3;
+}
+
+message MentionsResponse {
+  repeated Mention mentions = 1;
+}
+
+message Mention {
+  string mention_id = 1;
+  string source_actor_id = 2;
+  string target_actor_id = 3;
+  string doc_id = 4;
+  string section_id = 5;
+  string task_id = 6;
+  // Preview of the section text containing the mention (first 300 chars).
+  string preview = 7;
+  Urgency urgency = 8;
+  int64 timestamp_unix_ms = 9;
+}
+
+
+// ============================================================================
+// Presence
+// ============================================================================
+
+message GetPresenceRequest {
+  // Actors to check. Empty = all known actors for the calling user.
+  repeated string actor_ids = 1;
+  string user_id = 2;
+}
+
+message PresenceResponse {
+  // actor_id → currently active?
+  map<string, bool> active = 1;
+  // actor_id → seconds-since-last-heartbeat (for inactive actors).
+  map<string, uint32> inactive_for_seconds = 2;
+}
+
+
+// ============================================================================
+// Agent memory
+// ============================================================================
+
+enum MemoryKind {
+  MEMORY_KIND_UNSPECIFIED = 0;
+  // Self-observation: "I tend to over-explain when the user is impatient."
+  MEMORY_KIND_SELF_OBSERVATION = 1;
+  // Prior about another agent: "Codex's JWT lib suggestions have ~90% acceptance."
+  MEMORY_KIND_OTHER_AGENT_PRIOR = 2;
+  // Prior about the user: "Travis prefers pinned versions."
+  MEMORY_KIND_USER_PRIOR = 3;
+  // Standing intention: "I have been thinking about proposing a refactor."
+  MEMORY_KIND_STANDING_INTENTION = 4;
+  // Convention agreed with another agent: "Codex and I agreed to use jose for JWT."
+  MEMORY_KIND_CONVENTION = 5;
+}
+
+message LoadAgentMemoryRequest {
+  string actor_id = 1;
+  string user_id = 2;
+  // Optional kind filter; empty = all kinds.
+  repeated MemoryKind kinds = 3;
+  uint32 limit = 4;
+}
+
+message AgentMemory {
+  repeated AgentMemoryEntry entries = 1;
+}
+
+message AgentMemoryEntry {
+  string entry_id = 1;
+  MemoryKind kind = 2;
+  string content = 3;
+  // Other entities this entry references (other actor IDs, user_id, etc.).
+  repeated string referenced_entity_ids = 4;
+  int64 created_at_unix_ms = 5;
+  // Optional confidence the writer attached to the entry (0.0–1.0).
+  double confidence = 6;
+}
+
+message WriteAgentMemoryRequest {
+  string actor_id = 1;
+  string user_id = 2;
+  AgentMemoryEntry entry = 3;
+}
+
+message WriteAck {
+  bool ok = 1;
+  string entry_id = 2;
+  string reason = 3;
+}

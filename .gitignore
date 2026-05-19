@@ -1,0 +1,14 @@
+# Generated bindings (per-consumer)
+*.pb.go
+*_pb2.py
+*_pb2_grpc.py
+*.pb.cc
+*.pb.h
+generated/
+
+# Tooling
+.DS_Store
+target/
+node_modules/
+__pycache__/
+*.pyc
